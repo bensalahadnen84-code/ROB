@@ -1,0 +1,169 @@
+"""
+Smart Farm Monitoring System - version améliorée
+Lecture des capteurs, envoi au serveur, contrôle automatique
+avec hystérésis, protection de la pompe et tolérance aux pannes réseau.
+"""
+ 
+import math
+import time
+ 
+import requests
+ 
+# ------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------
+SERVER_URL = "http://your-server/api/data"
+ 
+READ_INTERVAL = 60          # secondes entre deux cycles
+HTTP_TIMEOUT = 5            # secondes
+ 
+# Ventilateur : hystérésis sur la température (°C)
+FAN_ON_TEMP = 32
+FAN_OFF_TEMP = 30
+ 
+# Pompe : hystérésis sur l'humidité du sol (%)
+PUMP_ON_SOIL = 30
+PUMP_OFF_SOIL = 45
+PUMP_MAX_RUN = 120          # durée max de fonctionnement continu (s)
+PUMP_COOLDOWN = 600         # pause obligatoire après un arrêt de sécurité (s)
+ 
+# Plages de valeurs plausibles pour valider les capteurs
+TEMP_RANGE = (-10, 60)
+HUM_RANGE = (0, 100)
+SOIL_RANGE = (0, 100)
+ 
+# ------------------------------------------------------------------
+# État du système
+# ------------------------------------------------------------------
+fan_on = False
+pump_on = False
+pump_started_at = None
+pump_blocked_until = 0
+ 
+ 
+# ------------------------------------------------------------------
+# Capteurs
+# ------------------------------------------------------------------
+def is_valid(value, value_range):
+    """Vrai si la valeur est un nombre réel dans la plage attendue."""
+    if value is None:
+        return False
+    if isinstance(value, float) and math.isnan(value):
+        return False
+    low, high = value_range
+    return low <= value <= high
+ 
+ 
+def read_sensors():
+    """Lit les capteurs ; renvoie None pour une valeur invalide."""
+    try:
+        temp = dht.read_temperature()
+        hum = dht.read_humidity()
+    except Exception as e:
+        print("Erreur DHT :", e)
+        temp, hum = None, None
+ 
+    try:
+        soil = read_soil_moisture()
+    except Exception as e:
+        print("Erreur capteur sol :", e)
+        soil = None
+ 
+    temp = temp if is_valid(temp, TEMP_RANGE) else None
+    hum = hum if is_valid(hum, HUM_RANGE) else None
+    soil = soil if is_valid(soil, SOIL_RANGE) else None
+    return temp, hum, soil
+ 
+ 
+# ------------------------------------------------------------------
+# Réseau
+# ------------------------------------------------------------------
+def send_data(temp, hum, soil):
+    """Envoie les données ; une panne réseau ne doit jamais arrêter le contrôle."""
+    data = {
+        "temperature": temp,
+        "humidity": hum,
+        "soil_moisture": soil,
+        "fan": fan_on,
+        "pump": pump_on,
+        "timestamp": int(time.time()),
+    }
+    try:
+        r = requests.post(SERVER_URL, json=data, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print("Envoi échoué :", e)
+ 
+ 
+# ------------------------------------------------------------------
+# Contrôle automatique
+# ------------------------------------------------------------------
+def control_fan(temp):
+    global fan_on
+    if temp is None:
+        return  # valeur inconnue : on garde l'état actuel
+    if not fan_on and temp > FAN_ON_TEMP:
+        activate_fan()
+        fan_on = True
+    elif fan_on and temp < FAN_OFF_TEMP:
+        deactivate_fan()
+        fan_on = False
+ 
+ 
+def control_pump(soil):
+    global pump_on, pump_started_at, pump_blocked_until
+    now = time.time()
+ 
+    # Sécurité : capteur invalide -> on arrête la pompe par prudence
+    if soil is None:
+        if pump_on:
+            deactivate_pump()
+            pump_on = False
+        return
+ 
+    if pump_on:
+        too_long = now - pump_started_at > PUMP_MAX_RUN
+        if soil > PUMP_OFF_SOIL or too_long:
+            deactivate_pump()
+            pump_on = False
+            if too_long:
+                pump_blocked_until = now + PUMP_COOLDOWN
+                print("Arrêt de sécurité de la pompe (durée maximale atteinte)")
+    elif soil < PUMP_ON_SOIL and now >= pump_blocked_until:
+        activate_pump()
+        pump_on = True
+        pump_started_at = now
+ 
+ 
+def control_system(temp, soil):
+    control_fan(temp)
+    control_pump(soil)
+ 
+ 
+def shutdown_outputs():
+    """Coupe tous les actionneurs (arrêt du programme ou erreur grave)."""
+    global fan_on, pump_on
+    deactivate_fan()
+    deactivate_pump()
+    fan_on = pump_on = False
+ 
+ 
+# ------------------------------------------------------------------
+# Boucle principale
+# ------------------------------------------------------------------
+def main():
+    try:
+        while True:
+            t, h, s = read_sensors()
+            control_system(t, s)   # le contrôle local passe avant le réseau
+            send_data(t, h, s)
+            time.sleep(READ_INTERVAL)
+    except KeyboardInterrupt:
+        print("Arrêt demandé")
+    finally:
+        shutdown_outputs()
+ 
+ 
+if __name__ == "__main__":
+    main()
+ 
