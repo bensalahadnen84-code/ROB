@@ -1,169 +1,275 @@
+gui · PY
 """
-Smart Farm Monitoring System - version améliorée
-Lecture des capteurs, envoi au serveur, contrôle automatique
-avec hystérésis, protection de la pompe et tolérance aux pannes réseau.
+Smart Farm Monitoring System - interface graphique (Tkinter)
+ 
+Utilise smart_farm.py (même dossier) sans le modifier :
+la boucle while True est remplacée par root.after(), ce qui permet
+d'afficher les valeurs, l'état des actionneurs et un graphique en direct.
+ 
+Lancement :
+    python smart_farm_gui.py          # matériel réel
+    python smart_farm_gui.py --demo   # simulation, sans capteurs
 """
  
-import math
+import argparse
+import random
+import threading
 import time
+import tkinter as tk
+from collections import deque
+from tkinter import ttk
+from types import SimpleNamespace
  
-import requests
+import smart_farm as sf
  
-# ------------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------------
-SERVER_URL = "http://your-server/api/data"
+HISTORY_LEN = 60
  
-READ_INTERVAL = 60          # secondes entre deux cycles
-HTTP_TIMEOUT = 5            # secondes
- 
-# Ventilateur : hystérésis sur la température (°C)
-FAN_ON_TEMP = 32
-FAN_OFF_TEMP = 30
- 
-# Pompe : hystérésis sur l'humidité du sol (%)
-PUMP_ON_SOIL = 30
-PUMP_OFF_SOIL = 45
-PUMP_MAX_RUN = 120          # durée max de fonctionnement continu (s)
-PUMP_COOLDOWN = 600         # pause obligatoire après un arrêt de sécurité (s)
- 
-# Plages de valeurs plausibles pour valider les capteurs
-TEMP_RANGE = (-10, 60)
-HUM_RANGE = (0, 100)
-SOIL_RANGE = (0, 100)
- 
-# ------------------------------------------------------------------
-# État du système
-# ------------------------------------------------------------------
-fan_on = False
-pump_on = False
-pump_started_at = None
-pump_blocked_until = 0
+COLORS = {
+    "temp": "#e4572e",
+    "hum": "#2e86de",
+    "soil": "#2a9d4b",
+    "on": "#2a9d4b",
+    "off": "#b0b0b0",
+    "warn": "#d62828",
+}
  
  
 # ------------------------------------------------------------------
-# Capteurs
+# Simulation (mode --demo) : permet de tester l'interface sans matériel
 # ------------------------------------------------------------------
-def is_valid(value, value_range):
-    """Vrai si la valeur est un nombre réel dans la plage attendue."""
-    if value is None:
-        return False
-    if isinstance(value, float) and math.isnan(value):
-        return False
-    low, high = value_range
-    return low <= value <= high
+class Simulator:
+    def __init__(self):
+        self.temp, self.hum, self.soil = 29.0, 60.0, 50.0
  
+    def step(self):
+        self.temp += random.uniform(-0.3, 0.9) - (1.2 if sf.fan_on else 0)
+        self.temp = max(15, min(45, self.temp))
+        self.hum = max(20, min(95, self.hum + random.uniform(-2, 2)))
+        self.soil += random.uniform(-2.5, -0.5) + (6 if sf.pump_on else 0)
+        self.soil = max(0, min(100, self.soil))
  
-def read_sensors():
-    """Lit les capteurs ; renvoie None pour une valeur invalide."""
-    try:
-        temp = dht.read_temperature()
-        hum = dht.read_humidity()
-    except Exception as e:
-        print("Erreur DHT :", e)
-        temp, hum = None, None
- 
-    try:
-        soil = read_soil_moisture()
-    except Exception as e:
-        print("Erreur capteur sol :", e)
-        soil = None
- 
-    temp = temp if is_valid(temp, TEMP_RANGE) else None
-    hum = hum if is_valid(hum, HUM_RANGE) else None
-    soil = soil if is_valid(soil, SOIL_RANGE) else None
-    return temp, hum, soil
+    def install(self):
+        sf.dht = SimpleNamespace(
+            read_temperature=lambda: self.temp,
+            read_humidity=lambda: self.hum,
+        )
+        sf.read_soil_moisture = lambda: self.soil
+        sf.activate_fan = lambda: None
+        sf.deactivate_fan = lambda: None
+        sf.activate_pump = lambda: None
+        sf.deactivate_pump = lambda: None
+        sf.send_data = lambda *args: None
  
  
 # ------------------------------------------------------------------
-# Réseau
+# Interface
 # ------------------------------------------------------------------
-def send_data(temp, hum, soil):
-    """Envoie les données ; une panne réseau ne doit jamais arrêter le contrôle."""
-    data = {
-        "temperature": temp,
-        "humidity": hum,
-        "soil_moisture": soil,
-        "fan": fan_on,
-        "pump": pump_on,
-        "timestamp": int(time.time()),
-    }
-    try:
-        r = requests.post(SERVER_URL, json=data, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        print("Envoi échoué :", e)
+class App:
+    def __init__(self, root, interval_s, sim=None):
+        self.root = root
+        self.sim = sim
+        self.interval_ms = int(interval_s * 1000)
+        self.history = {k: deque(maxlen=HISTORY_LEN) for k in ("temp", "hum", "soil")}
+        self.job = None
+        self.last_states = (False, False)
+ 
+        root.title("Smart Farm Monitoring System")
+        root.geometry("820x640")
+        root.minsize(700, 560)
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+ 
+        self.build_ui()
+        self.cycle()
+ 
+    # ---------- construction ----------
+    def build_ui(self):
+        main = ttk.Frame(self.root, padding=12)
+        main.pack(fill="both", expand=True)
+ 
+        title = "Smart Farm Monitoring System"
+        if self.sim:
+            title += "  (mode démo)"
+        ttk.Label(main, text=title, font=("Helvetica", 16, "bold")).pack(anchor="w")
+ 
+        # Cartes de mesures
+        cards = ttk.Frame(main)
+        cards.pack(fill="x", pady=(10, 6))
+        self.value_labels = {}
+        for i, (key, name, unit) in enumerate([
+            ("temp", "Température", "°C"),
+            ("hum", "Humidité de l'air", "%"),
+            ("soil", "Humidité du sol", "%"),
+        ]):
+            cards.columnconfigure(i, weight=1, uniform="card")
+            box = ttk.LabelFrame(cards, text=name, padding=10)
+            box.grid(row=0, column=i, sticky="nsew", padx=4)
+            lbl = tk.Label(box, text="--", font=("Helvetica", 30, "bold"),
+                           fg=COLORS[key])
+            lbl.pack()
+            ttk.Label(box, text=unit).pack()
+            self.value_labels[key] = lbl
+ 
+        # Actionneurs
+        act = ttk.LabelFrame(main, text="État du système", padding=10)
+        act.pack(fill="x", pady=6, padx=4)
+        self.led = {}
+        for key, name in (("fan", "Ventilateur"), ("pump", "Pompe à eau")):
+            frame = ttk.Frame(act)
+            frame.pack(side="left", padx=20)
+            c = tk.Canvas(frame, width=22, height=22, highlightthickness=0)
+            c.pack(side="left")
+            oval = c.create_oval(3, 3, 19, 19, fill=COLORS["off"], outline="")
+            ttk.Label(frame, text=name).pack(side="left", padx=6)
+            state = ttk.Label(frame, text="ARRÊT", width=8)
+            state.pack(side="left")
+            self.led[key] = (c, oval, state)
+ 
+        # Graphique
+        chart_box = ttk.LabelFrame(main, text="Évolution des mesures", padding=6)
+        chart_box.pack(fill="both", expand=True, pady=6, padx=4)
+        self.chart = tk.Canvas(chart_box, height=200, bg="white",
+                               highlightthickness=0)
+        self.chart.pack(fill="both", expand=True)
+        self.chart.bind("<Configure>", lambda e: self.draw_chart())
+ 
+        # Journal
+        log_box = ttk.LabelFrame(main, text="Journal", padding=6)
+        log_box.pack(fill="x", pady=6, padx=4)
+        self.log = tk.Text(log_box, height=6, state="disabled", wrap="word")
+        self.log.pack(fill="x")
+ 
+        # Pied de page
+        foot = ttk.Frame(main)
+        foot.pack(fill="x")
+        self.status = ttk.Label(foot, text="En attente de la première mesure...")
+        self.status.pack(side="left")
+        ttk.Button(foot, text="Quitter", command=self.on_close).pack(side="right")
+ 
+    # ---------- cycle de mesure ----------
+    def cycle(self):
+        if self.sim:
+            self.sim.step()
+ 
+        t, h, s = sf.read_sensors()
+        sf.control_system(t, s)  # contrôle local d'abord
+ 
+        # Envoi réseau dans un thread : ne bloque jamais l'interface
+        threading.Thread(target=sf.send_data, args=(t, h, s), daemon=True).start()
+ 
+        for key, val in (("temp", t), ("hum", h), ("soil", s)):
+            self.history[key].append(val)
+ 
+        self.update_values(t, h, s)
+        self.update_actuators()
+        self.draw_chart()
+        self.status.config(text="Dernière mesure : " + time.strftime("%H:%M:%S"))
+ 
+        self.job = self.root.after(self.interval_ms, self.cycle)
+ 
+    # ---------- mise à jour de l'affichage ----------
+    def update_values(self, t, h, s):
+        for key, val in (("temp", t), ("hum", h), ("soil", s)):
+            lbl = self.value_labels[key]
+            if val is None:
+                lbl.config(text="ERR", fg=COLORS["warn"])
+                self.write_log(f"Lecture invalide ({key})")
+            else:
+                lbl.config(text=f"{val:.1f}", fg=COLORS[key])
+        if t is not None and t > sf.FAN_ON_TEMP:
+            self.value_labels["temp"].config(fg=COLORS["warn"])
+        if s is not None and s < sf.PUMP_ON_SOIL:
+            self.value_labels["soil"].config(fg=COLORS["warn"])
+ 
+    def update_actuators(self):
+        states = (sf.fan_on, sf.pump_on)
+        for key, on in zip(("fan", "pump"), states):
+            canvas, oval, label = self.led[key]
+            canvas.itemconfig(oval, fill=COLORS["on"] if on else COLORS["off"])
+            label.config(text="MARCHE" if on else "ARRÊT")
+        names = ("Ventilateur", "Pompe")
+        for name, before, now in zip(names, self.last_states, states):
+            if before != now:
+                self.write_log(f"{name} {'activé' if now else 'arrêté'}")
+        self.last_states = states
+ 
+    def write_log(self, message):
+        self.log.config(state="normal")
+        self.log.insert("end", f"[{time.strftime('%H:%M:%S')}] {message}\n")
+        self.log.see("end")
+        self.log.config(state="disabled")
+ 
+    def draw_chart(self):
+        c = self.chart
+        c.delete("all")
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 100 or h < 80:
+            return
+        left, right, top, bottom = 36, 10, 10, 26
+        pw, ph = w - left - right, h - top - bottom
+ 
+        # Grille et axe Y (0 - 100)
+        for v in (0, 25, 50, 75, 100):
+            y = top + ph - ph * v / 100
+            c.create_line(left, y, w - right, y, fill="#e6e6e6")
+            c.create_text(left - 6, y, text=str(v), anchor="e",
+                          fill="#777", font=("Helvetica", 8))
+ 
+        # Courbes (les valeurs invalides interrompent la ligne)
+        step = pw / (HISTORY_LEN - 1)
+        for key, series in self.history.items():
+            offset = HISTORY_LEN - len(series)
+            segment = []
+            for i, val in enumerate(series):
+                if val is None:
+                    if len(segment) >= 4:
+                        c.create_line(*segment, fill=COLORS[key], width=2)
+                    segment = []
+                    continue
+                x = left + (offset + i) * step
+                y = top + ph - ph * max(0, min(100, val)) / 100
+                segment += [x, y]
+            if len(segment) >= 4:
+                c.create_line(*segment, fill=COLORS[key], width=2)
+ 
+        # Légende
+        x = left + 6
+        for key, name in (("temp", "Température (°C)"),
+                          ("hum", "Humidité air (%)"),
+                          ("soil", "Humidité sol (%)")):
+            c.create_rectangle(x, h - 17, x + 10, h - 7, fill=COLORS[key], outline="")
+            c.create_text(x + 14, h - 12, text=name, anchor="w",
+                          font=("Helvetica", 8))
+            x += 140
+ 
+    # ---------- fermeture ----------
+    def on_close(self):
+        if self.job:
+            self.root.after_cancel(self.job)
+        try:
+            sf.shutdown_outputs()  # coupe ventilateur et pompe
+        finally:
+            self.root.destroy()
  
  
-# ------------------------------------------------------------------
-# Contrôle automatique
-# ------------------------------------------------------------------
-def control_fan(temp):
-    global fan_on
-    if temp is None:
-        return  # valeur inconnue : on garde l'état actuel
-    if not fan_on and temp > FAN_ON_TEMP:
-        activate_fan()
-        fan_on = True
-    elif fan_on and temp < FAN_OFF_TEMP:
-        deactivate_fan()
-        fan_on = False
- 
- 
-def control_pump(soil):
-    global pump_on, pump_started_at, pump_blocked_until
-    now = time.time()
- 
-    # Sécurité : capteur invalide -> on arrête la pompe par prudence
-    if soil is None:
-        if pump_on:
-            deactivate_pump()
-            pump_on = False
-        return
- 
-    if pump_on:
-        too_long = now - pump_started_at > PUMP_MAX_RUN
-        if soil > PUMP_OFF_SOIL or too_long:
-            deactivate_pump()
-            pump_on = False
-            if too_long:
-                pump_blocked_until = now + PUMP_COOLDOWN
-                print("Arrêt de sécurité de la pompe (durée maximale atteinte)")
-    elif soil < PUMP_ON_SOIL and now >= pump_blocked_until:
-        activate_pump()
-        pump_on = True
-        pump_started_at = now
- 
- 
-def control_system(temp, soil):
-    control_fan(temp)
-    control_pump(soil)
- 
- 
-def shutdown_outputs():
-    """Coupe tous les actionneurs (arrêt du programme ou erreur grave)."""
-    global fan_on, pump_on
-    deactivate_fan()
-    deactivate_pump()
-    fan_on = pump_on = False
- 
- 
-# ------------------------------------------------------------------
-# Boucle principale
-# ------------------------------------------------------------------
 def main():
-    try:
-        while True:
-            t, h, s = read_sensors()
-            control_system(t, s)   # le contrôle local passe avant le réseau
-            send_data(t, h, s)
-            time.sleep(READ_INTERVAL)
-    except KeyboardInterrupt:
-        print("Arrêt demandé")
-    finally:
-        shutdown_outputs()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--demo", action="store_true",
+                        help="simule les capteurs et les actionneurs")
+    args = parser.parse_args()
+ 
+    sim = None
+    interval = sf.READ_INTERVAL
+    if args.demo:
+        sim = Simulator()
+        sim.install()
+        interval = 2  # cycle rapide pour voir l'interface réagir
+ 
+    root = tk.Tk()
+    App(root, interval, sim)
+    root.mainloop()
  
  
 if __name__ == "__main__":
     main()
+ 
  
